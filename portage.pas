@@ -1609,6 +1609,7 @@ function TPortageDB.RuntimeSatisfied(Pkg: TPkgInfo; RemovedCPVs: TStrings;
 var
   Tokens: TStringList;
   Posn: integer;
+  Failure: string;
 
   procedure SkipItem; forward;
   function EvalItem(out Present: boolean): boolean; forward;
@@ -1668,28 +1669,54 @@ var
   var
     ok, itemPresent: boolean;
     ntrue, nitems: integer;
+    SavedFailure, FirstFailure: string;
   begin
     Present := True;
-    ntrue := 0; nitems := 0;
-    if (Posn >= Tokens.Count) or (Tokens[Posn] <> '(') then exit(False);
+    ntrue := 0;
+    nitems := 0;
+    SavedFailure := Failure;
+    FirstFailure := '';
+
+    if (Posn >= Tokens.Count) or (Tokens[Posn] <> '(') then
+    begin
+      if Failure = '' then Failure := 'malformed dependency group after ' + Kind;
+      exit(False);
+    end;
+
     Inc(Posn);
     while Posn < Tokens.Count do
     begin
       if Tokens[Posn] = ')' then begin Inc(Posn); break; end;
+      Failure := '';
       ok := EvalItem(itemPresent);
       if itemPresent then
       begin
         Inc(nitems);
-        if ok then Inc(ntrue);
+        if ok then
+          Inc(ntrue)
+        else if (FirstFailure = '') and (Failure <> '') then
+          FirstFailure := Failure;
       end;
     end;
 
-    // USE-disabled alternatives disappear from the group; they do not count as
-    // a successful branch of ||.  An empty choice group is unsatisfied.
-    if nitems = 0 then exit(False);
-    if Kind = '||' then Result := ntrue >= 1
-    else if Kind = '^^' then Result := ntrue = 1
-    else Result := ntrue <= 1; // ??
+    if nitems = 0 then
+      Result := False
+    else if Kind = '||' then
+      Result := ntrue >= 1
+    else if Kind = '^^' then
+      Result := ntrue = 1
+    else
+      Result := ntrue <= 1; // ??
+
+    if Result then
+      Failure := SavedFailure
+    else
+    begin
+      if FirstFailure <> '' then
+        Failure := FirstFailure
+      else
+        Failure := 'unsatisfied dependency group ' + Kind;
+    end;
   end;
 
   function EvalItem(out Present: boolean): boolean;
@@ -1728,12 +1755,15 @@ var
 
     if tok = ')' then begin Present := False; exit(True); end;
     Result := AtomSatisfied(tok, Pkg, RemovedCPVs);
+    if not Result then
+      Failure := 'unsatisfied atom: ' + tok;
   end;
 
 var
   ok, present: boolean;
 begin
   Reason := '';
+  Failure := '';
   if (Pkg = nil) or (Trim(Pkg.RuntimeDepText) = '') then exit(True);
 
   Tokens := TStringList.Create;
@@ -1743,10 +1773,19 @@ begin
     Result := True;
     while Posn < Tokens.Count do
     begin
+      Failure := '';
       ok := EvalItem(present);
-      if present then Result := Result and ok;
+      if present and (not ok) then
+      begin
+        Result := False;
+        if Reason = '' then
+        begin
+          if Failure <> '' then Reason := Failure
+          else Reason := 'runtime dependency expression would no longer be satisfied';
+        end;
+      end;
     end;
-    if not Result then
+    if (not Result) and (Reason = '') then
       Reason := 'runtime dependency expression would no longer be satisfied';
   finally
     Tokens.Free;
@@ -1757,6 +1796,7 @@ function TPortageDB.RemovalClosure(Initial: TObjectList;
   out Reasons: TStringList): TObjectList;
 var
   Removed: TStringList;
+  BaselineBroken: TStringList;
   Discovery: TObjectList;
   i: integer;
   p: TPkgInfo;
@@ -1767,10 +1807,24 @@ begin
   Reasons := TStringList.Create;
   Reasons.NameValueSeparator := '=';
   Removed := TStringList.Create;
+  BaselineBroken := TStringList.Create;
   Discovery := TObjectList.Create(False);
   try
     Removed.Sorted := True;
     Removed.Duplicates := dupIgnore;
+    BaselineBroken.Sorted := True;
+    BaselineBroken.Duplicates := dupIgnore;
+
+    // A removal transaction must only include packages that become broken
+    // because of this transaction.  The vardb can already contain unrelated
+    // inconsistencies (especially while repairing a system); pulling those
+    // into every removal closure would turn a local operation into a cascade.
+    for i := 0 to FPackages.Count - 1 do
+    begin
+      p := TPkgInfo(FPackages[i]);
+      if not RuntimeSatisfied(p, nil, why) then
+        BaselineBroken.Add(p.CPV);
+    end;
 
     for i := 0 to Initial.Count - 1 do
     begin
@@ -1789,6 +1843,7 @@ begin
       begin
         p := TPkgInfo(FPackages[i]);
         if Removed.IndexOf(p.CPV) >= 0 then continue;
+        if BaselineBroken.IndexOf(p.CPV) >= 0 then continue;
         if not RuntimeSatisfied(p, Removed, why) then
         begin
           Removed.Add(p.CPV);
@@ -1805,6 +1860,7 @@ begin
       Result.Add(Discovery[i]);
   finally
     Discovery.Free;
+    BaselineBroken.Free;
     Removed.Free;
   end;
 end;
