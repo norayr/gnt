@@ -1,14 +1,10 @@
 // gnt-get - an apt-get flavoured front end for Gentoo.
 //
-// The useful addition here is recursive reverse-dependency removal.  The
-// dependency closure is computed directly from the installed Portage vardb via
-// portage.pas; emerge is invoked only to perform the requested package action.
-// No command is passed through a shell.
-//
-//   gnt-get update
-//   gnt-get install <package>... [-d|--download-only]
-//   gnt-get source  <package>... [-d|--download-only]   // install alias
-//   gnt-get remove  <package>... [-n|--dry-run] [-y|--yes]
+// Native installed-state solving lives in portage.pas: USE conditionals,
+// slots, version atoms and ||/^^/?? dependency groups are evaluated directly
+// from the installed Portage vardb. Package mutation/building still uses
+// emerge as a backend for now; the solver is deliberately being grown
+// independently so it can become a full package-manager core over time.
 
 program gntget;
 
@@ -22,13 +18,17 @@ var
 
 procedure Usage;
 begin
-  WriteLn('gnt-get 1.1 - apt-get style interface for Gentoo');
+  WriteLn('gnt-get 1.3 - Gentoo package front end + native installed-state solver');
   WriteLn;
   WriteLn('usage:');
-  WriteLn('  gnt-get update                         sync the tree (emerge --sync)');
-  WriteLn('  gnt-get install <package>...           install (emerge)');
-  WriteLn('  gnt-get source  <package>...           install alias (Gentoo normally builds source)');
-  WriteLn('  gnt-get remove  <package>...           remove, and everything using it');
+  WriteLn('  gnt-get update                         sync repositories (emerge backend)');
+  WriteLn('  gnt-get install <package>...           install (emerge backend)');
+  WriteLn('  gnt-get source  <package>...           install alias');
+  WriteLn('  gnt-get upgrade                        update @world');
+  WriteLn('  gnt-get full-upgrade                   deep @world update incl. build deps');
+  WriteLn('  gnt-get remove  <package>...           native recursive removal solver');
+  WriteLn('  gnt-get rdepends <package>...          show what would recursively break');
+  WriteLn('  gnt-get check                          verify installed runtime dependency graph');
   WriteLn;
   WriteLn('flags:');
   WriteLn('  -d, --download-only   fetch only (install/source)');
@@ -36,41 +36,9 @@ begin
   WriteLn('  -y, --yes             remove: do not ask for confirmation');
 end;
 
-function Lower(const s: string): string;
+function Lower(const S: string): string;
 begin
-  Result := LowerCase(s);
-end;
-
-// --- recursive removal ------------------------------------------------------
-
-var
-  Seen: TStringList;    // sorted, dupIgnore; holds CPVs already scheduled
-  Order: TStringList;   // CPVs in removal order: dependants before the target
-
-// Depth-first post-order: a package is appended only after every package that
-// depends on it, so dependants are unmerged first. Cycles are stopped by Seen.
-//
-// The lookup uses the bare "cat/pkg" atom, not the installed version: a
-// dependant may constrain us with ">=cat/pkg-2" and still break the moment we
-// disappear, even though its DEPEND text never names the installed version.
-procedure CollectDependants(P: TPkgInfo);
-var
-  Deps: TObjectList;
-  i: integer;
-begin
-  if Seen.IndexOf(P.CPV) >= 0 then
-    exit;
-  Seen.Add(P.CPV);
-
-  Deps := DB.ReverseRuntimeDepends(P.Atom);
-  try
-    for i := 0 to Deps.Count - 1 do
-      CollectDependants(TPkgInfo(Deps.Items[i]));
-  finally
-    Deps.Free;
-  end;
-
-  Order.Add(P.CPV);
+  Result := LowerCase(S);
 end;
 
 function JoinArgs(const AArgs: array of string): string;
@@ -80,19 +48,14 @@ begin
   Result := '';
   for i := 0 to High(AArgs) do
   begin
-    if i > 0 then
-      Result := Result + ' ';
+    if i > 0 then Result := Result + ' ';
     Result := Result + AArgs[i];
   end;
 end;
 
 function EmergePath: string;
 begin
-  // ExecuteProcess() does not reliably PATH-search a bare executable name on
-  // every FPC/process combination.  Gentoo's canonical path is preferred; the
-  // PATH lookup keeps test/chroot layouts usable.
-  if FileExists('/usr/bin/emerge') then
-    exit('/usr/bin/emerge');
+  if FileExists('/usr/bin/emerge') then exit('/usr/bin/emerge');
   Result := FileSearch('emerge', GetEnvironmentVariable('PATH'));
   if Result = '' then
   begin
@@ -152,8 +115,6 @@ var
   i: integer;
 begin
   Result := False;
-  // A category-qualified atom is already unambiguous. Multiple installed
-  // versions/slots of that one atom are legitimate matches.
   if Pos('/', Spec) > 0 then exit;
 
   atoms := TStringList.Create;
@@ -180,101 +141,168 @@ begin
   WriteLn(StdErr, 'Please specify the category (and slot if needed).');
 end;
 
-procedure CmdRemove(const Specs: array of string; DryRun, AssumeYes: Boolean);
+function ResolveInstalledSpecs(const Specs: array of string): TObjectList;
 var
   i, j: integer;
   l: TObjectList;
-  answer: string;
+  p: TPkgInfo;
 begin
-  Seen := TStringList.Create;
-  Seen.Sorted := True;
-  Seen.Duplicates := dupIgnore;
-  Order := TStringList.Create;
-  try
-    // Validate every name first, so a typo aborts the whole operation rather
-    // than removing a partial set.
-    for i := 0 to High(Specs) do
-    begin
-      l := DB.FindAll(Specs[i]);
-      try
-        if l.Count = 0 then
-        begin
-          WriteLn(StdErr, 'gnt-get: package not installed: ', Specs[i]);
-          Halt(1);
-        end;
-        if AmbiguousBareSpec(Specs[i], l) then
-        begin
-          PrintAmbiguousMatches(Specs[i], l);
-          Halt(1);
-        end;
-      finally
-        l.Free;
-      end;
-    end;
-
-    Write('Building dependency tree... ');
-    for i := 0 to High(Specs) do
-    begin
-      l := DB.FindAll(Specs[i]);
-      try
-        for j := 0 to l.Count - 1 do
-          CollectDependants(TPkgInfo(l.Items[j]));
-      finally
-        l.Free;
-      end;
-    end;
-    WriteLn('Done');
-
-    if Order.Count = 0 then
-    begin
-      WriteLn('Nothing to do.');
-      exit;
-    end;
-
-    WriteLn('The following packages will be REMOVED:');
-    for i := 0 to Order.Count - 1 do
-      WriteLn('  ', Order[i]);
-
-    if DryRun then
-    begin
-      WriteLn('(dry run: no packages were removed)');
-      exit;
-    end;
-
-    if not AssumeYes then
-    begin
-      Write('Do you want to continue? [y/N] ');
-      ReadLn(answer);
-      if answer = '' then
+  Result := TObjectList.Create(False);
+  for i := 0 to High(Specs) do
+  begin
+    l := DB.FindAll(Specs[i]);
+    try
+      if l.Count = 0 then
       begin
-        WriteLn('Aborted.');
+        WriteLn(StdErr, 'gnt-get: package not installed: ', Specs[i]);
+        Result.Free;
         Halt(1);
       end;
-      if UpCase(answer[1]) <> 'Y' then
+      if AmbiguousBareSpec(Specs[i], l) then
       begin
-        WriteLn('Aborted.');
+        PrintAmbiguousMatches(Specs[i], l);
+        Result.Free;
         Halt(1);
       end;
+      for j := 0 to l.Count - 1 do
+      begin
+        p := TPkgInfo(l[j]);
+        if Result.IndexOf(p) < 0 then Result.Add(p);
+      end;
+    finally
+      l.Free;
     end;
-
-    for i := 0 to Order.Count - 1 do
-      // Order contains an exact installed CPV.  Prefix '=' so emerge parses it
-      // as an exact atom rather than a package name containing digits.
-      RunEmerge(['--unmerge', '=' + Order[i]]);
-  finally
-    Order.Free;
-    Seen.Free;
   end;
 end;
 
-// --- dispatch ---------------------------------------------------------------
+procedure PrintRemovalPlan(Closure: TObjectList; Reasons: TStringList);
+var
+  i: integer;
+  p: TPkgInfo;
+  why: string;
+begin
+  WriteLn('The following packages will be REMOVED:');
+  for i := 0 to Closure.Count - 1 do
+  begin
+    p := TPkgInfo(Closure[i]);
+    why := Reasons.Values[p.CPV];
+    if (why <> '') and (why <> 'requested') then
+      WriteLn('  ', p.CPV, '  [', why, ']')
+    else
+      WriteLn('  ', p.CPV);
+  end;
+end;
+
+procedure CmdRemove(const Specs: array of string; DryRun, AssumeYes: Boolean);
+var
+  i: integer;
+  Initial, Closure: TObjectList;
+  Reasons: TStringList;
+  answer: string;
+begin
+  Initial := ResolveInstalledSpecs(Specs);
+  try
+    Write('Building dependency tree... ');
+    Closure := DB.RemovalClosure(Initial, Reasons);
+    try
+      WriteLn('Done');
+      if Closure.Count = 0 then
+      begin
+        WriteLn('Nothing to do.');
+        exit;
+      end;
+
+      PrintRemovalPlan(Closure, Reasons);
+      if DryRun then
+      begin
+        WriteLn('(dry run: no packages were removed)');
+        exit;
+      end;
+
+      if not AssumeYes then
+      begin
+        Write('Do you want to continue? [y/N] ');
+        ReadLn(answer);
+        if (answer = '') or (UpCase(answer[1]) <> 'Y') then
+        begin
+          WriteLn('Aborted.');
+          Halt(1);
+        end;
+      end;
+
+      for i := 0 to Closure.Count - 1 do
+        RunEmerge(['--unmerge', '=' + TPkgInfo(Closure[i]).CPV]);
+    finally
+      Closure.Free;
+      Reasons.Free;
+    end;
+  finally
+    Initial.Free;
+  end;
+end;
+
+procedure CmdRDepends(const Specs: array of string);
+var
+  i: integer;
+  Initial, Closure: TObjectList;
+  Reasons: TStringList;
+  p: TPkgInfo;
+begin
+  Initial := ResolveInstalledSpecs(Specs);
+  try
+    Closure := DB.RemovalClosure(Initial, Reasons);
+    try
+      for i := 0 to Closure.Count - 1 do
+      begin
+        p := TPkgInfo(Closure[i]);
+        if Reasons.Values[p.CPV] <> 'requested' then
+          WriteLn(p.CPV);
+      end;
+    finally
+      Closure.Free;
+      Reasons.Free;
+    end;
+  finally
+    Initial.Free;
+  end;
+end;
+
+procedure CmdCheck;
+var
+  i, broken: integer;
+  p: TPkgInfo;
+  Empty: TStringList;
+  why: string;
+begin
+  Empty := TStringList.Create;
+  try
+    Empty.Sorted := True;
+    broken := 0;
+    for i := 0 to DB.Packages.Count - 1 do
+    begin
+      p := TPkgInfo(DB.Packages[i]);
+      if not DB.RuntimeSatisfied(p, Empty, why) then
+      begin
+        Inc(broken);
+        WriteLn(p.CPV, ': ', why);
+      end;
+    end;
+    if broken = 0 then
+      WriteLn('All installed runtime dependency expressions are satisfied.')
+    else
+      WriteLn(broken, ' installed package(s) have unsatisfied runtime dependencies.');
+  finally
+    Empty.Free;
+  end;
+  if broken <> 0 then Halt(1);
+end;
 
 var
   Args, PackageArgs: TStringList;
   Cmd: string;
   DryRun, AssumeYes, DownloadOnly: Boolean;
   i: integer;
-  RemoveSpecs: array of string;
+  Specs: array of string;
 
 begin
   if ParamCount = 0 then
@@ -285,11 +313,12 @@ begin
 
   Args := TStringList.Create;
   try
-    for i := 1 to ParamCount do
-      Args.Add(ParamStr(i));
+    for i := 1 to ParamCount do Args.Add(ParamStr(i));
 
     Cmd := Lower(Args[0]);
-    DryRun := (Args.IndexOf('-n') >= 0) or (Args.IndexOf('--dry-run') >= 0);
+    DryRun := (Args.IndexOf('-n') >= 0) or
+              (Args.IndexOf('--dry-run') >= 0) or
+              (Args.IndexOf('--pretend') >= 0);
     AssumeYes := (Args.IndexOf('-y') >= 0) or (Args.IndexOf('--yes') >= 0);
     DownloadOnly := (Args.IndexOf('-d') >= 0) or
                     (Args.IndexOf('--download-only') >= 0);
@@ -306,15 +335,38 @@ begin
       Halt(0);
     end;
 
-    if (Cmd <> 'remove') and (Cmd <> 'install') and (Cmd <> 'source') then
+    if Cmd = 'upgrade' then
+    begin
+      RunEmerge(['-avuD', '--changed-use', '@world']);
+      Halt(0);
+    end;
+
+    if (Cmd = 'full-upgrade') or (Cmd = 'dist-upgrade') then
+    begin
+      RunEmerge(['-avuDN', '--changed-use', '--with-bdeps=y',
+        '--complete-graph=y', '@world']);
+      Halt(0);
+    end;
+
+    if Cmd = 'check' then
+    begin
+      DB := TPortageDB.Create;
+      try
+        CmdCheck;
+      finally
+        DB.Free;
+      end;
+      Halt(0);
+    end;
+
+    if (Cmd <> 'remove') and (Cmd <> 'rdepends') and
+       (Cmd <> 'install') and (Cmd <> 'source') then
     begin
       WriteLn(StdErr, 'gnt-get: unknown command ''', Args[0], '''');
       Usage;
       Halt(2);
     end;
 
-    // Flags may appear before, between or after package names.  Only non-option
-    // arguments become package specs.
     PackageArgs := TStringList.Create;
     try
       for i := 1 to Args.Count - 1 do
@@ -328,14 +380,16 @@ begin
         Halt(2);
       end;
 
-      if Cmd = 'remove' then
+      if (Cmd = 'remove') or (Cmd = 'rdepends') then
       begin
-        SetLength(RemoveSpecs, PackageArgs.Count);
-        for i := 0 to PackageArgs.Count - 1 do
-          RemoveSpecs[i] := PackageArgs[i];
+        SetLength(Specs, PackageArgs.Count);
+        for i := 0 to PackageArgs.Count - 1 do Specs[i] := PackageArgs[i];
         DB := TPortageDB.Create;
         try
-          CmdRemove(RemoveSpecs, DryRun, AssumeYes);
+          if Cmd = 'remove' then
+            CmdRemove(Specs, DryRun, AssumeYes)
+          else
+            CmdRDepends(Specs);
         finally
           DB.Free;
         end;

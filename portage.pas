@@ -35,6 +35,7 @@ type
     FIUse: TStringList;
     FDependAtoms: TStringList;
     FRuntimeDependAtoms: TStringList;
+    FRuntimeDepText: string;
     FContents: TStringList;
     FContentsLoaded: boolean;
     function GetCPV: string;
@@ -43,6 +44,7 @@ type
     function GetIUse: TStringList;
     function GetDependAtoms: TStringList;
     function GetRuntimeDependAtoms: TStringList;
+    function GetRuntimeDepText: string;
     function GetContents: TStringList;
     function GetContentsLoaded: boolean;
     function GetVersionNoRev: string;
@@ -73,6 +75,8 @@ type
     property DependAtoms: TStringList read GetDependAtoms;
     // Active installed runtime/post dependencies (RDEPEND + PDEPEND).
     property RuntimeDependAtoms: TStringList read GetRuntimeDependAtoms;
+    // Raw installed RDEPEND + PDEPEND expression, used by the native solver.
+    property RuntimeDepText: string read GetRuntimeDepText;
     // Every path recorded in this package's CONTENTS file.
     property Contents: TStringList read GetContents;
     property ContentsLoaded: boolean read GetContentsLoaded;
@@ -127,6 +131,17 @@ type
     // Installed packages whose active RDEPEND/PDEPEND references ADep.
     function ReverseRuntimeDepends(const ADep: string): TObjectList;
     function ReverseDependsAtom(const AAtom: string; AExactVersion: string = ''): TObjectList;
+
+    // Native installed-state solver.  These routines do not invoke Portage.
+    // RemovedCPVs is a set/list of exact installed CPVs that are assumed absent.
+    function AtomSatisfied(const AAtom: string; Depender: TPkgInfo;
+      RemovedCPVs: TStrings): boolean;
+    function RuntimeSatisfied(Pkg: TPkgInfo; RemovedCPVs: TStrings;
+      out Reason: string): boolean;
+    // Compute the recursive set that must disappear together with Initial.
+    // The returned non-owning list is ordered dependants first, requested
+    // providers last, suitable for unmerge. Reasons maps CPV=requested/broken.
+    function RemovalClosure(Initial: TObjectList; out Reasons: TStringList): TObjectList;
   end;
 
 // ---------------------------------------------------------------- helpers ---
@@ -572,22 +587,24 @@ begin
   rest := Copy(s, c + 1, Length(s) - c);
   if ACat = '' then exit(False);
 
+  // USE dependencies follow the slot in a complete atom.  Strip them before
+  // parsing the slot so ":5[foo]" does not accidentally become slot "5[foo]".
+  b := PosEx('[', rest, 1);
+  if b > 0 then rest := Copy(rest, 1, b - 1);
+
   // Slot / subslot, ":2/3=" or ":0" or ":*".
   b := PosEx(':', rest, 1);
   if b > 0 then
   begin
     ASlot := Copy(rest, b + 1, Length(rest) - b);
     rest := Copy(rest, 1, b - 1);
-    // Trailing "=" marks an exact slot match.
+    // Trailing "=" is a slot operator. For installed-state satisfaction we
+    // only need the primary slot value.
     if (ASlot <> '') and (ASlot[Length(ASlot)] = '=') then
       SetLength(ASlot, Length(ASlot) - 1);
     if Pos('/', ASlot) > 0 then
       ASlot := Copy(ASlot, 1, Pos('/', ASlot) - 1);
   end;
-
-  // USE dependencies.
-  b := PosEx('[', rest, 1);
-  if b > 0 then rest := Copy(rest, 1, b - 1);
 
   if rest = '' then exit(False);
 
@@ -661,7 +678,8 @@ begin
   FRuntimeDependAtoms := TStringList.Create;
   FRuntimeDependAtoms.Sorted := True;
   FRuntimeDependAtoms.Duplicates := dupIgnore;
-FContents := TStringList.Create;
+  FRuntimeDepText := '';
+  FContents := TStringList.Create;
     FContents.Sorted := True;
     FContents.Duplicates := dupIgnore;
     Slot := '0';
@@ -709,6 +727,11 @@ end;
 function TPkgInfo.GetRuntimeDependAtoms: TStringList;
 begin
   Result := FRuntimeDependAtoms;
+end;
+
+function TPkgInfo.GetRuntimeDepText: string;
+begin
+  Result := FRuntimeDepText;
 end;
 
 function TPkgInfo.GetContents: TStringList;
@@ -924,7 +947,12 @@ var
           // and IDEPEND may be removed after installation.  PDEPEND is a
           // post-merge runtime dependency and belongs with RDEPEND.
           if (DepFiles[i] = 'RDEPEND') or (DepFiles[i] = 'PDEPEND') then
+          begin
             AddActiveDepAtoms(p, sl.Text, p.RuntimeDependAtoms);
+            if p.FRuntimeDepText <> '' then
+              p.FRuntimeDepText := p.FRuntimeDepText + ' ';
+            p.FRuntimeDepText := p.FRuntimeDepText + sl.Text;
+          end;
         finally
           sl.Free;
         end;
@@ -1015,7 +1043,8 @@ begin
     if (p.Name <> wantPkg) then continue;
     if (wantCat <> '') and (p.Category <> wantCat) then continue;
     if (wantVer <> '') and (p.Version <> wantVer) then continue;
-    if (wantSlot <> '') and (p.Slot <> wantSlot) then continue;
+    if (wantSlot <> '') and (wantSlot <> '*') and
+       (Copy(p.Slot, 1, Pos(p.Slot + '/', '/') - 1) <> wantSlot) then continue;
     Result.Add(p);
   end;
 
@@ -1281,6 +1310,503 @@ begin
   else
     q := AAtom;
   Result := ReverseDepends(q);
+end;
+
+
+// ------------------------ installed-state dependency solver -----------------
+
+function IsInStringSet(S: TStrings; const V: string): boolean;
+begin
+  Result := (S <> nil) and (S.IndexOf(V) >= 0);
+end;
+
+function PrimarySlotOf(const S: string): string;
+var
+  p: integer;
+begin
+  p := Pos('/', S);
+  if p > 0 then Result := Copy(S, 1, p - 1) else Result := S;
+end;
+
+function RevisionNumber(const V: string): integer;
+var
+  p, n: integer;
+  x: string;
+begin
+  Result := 0;
+  p := RPos('-r', LowerCase(V));
+  if p = 0 then exit;
+  x := Copy(V, p + 2, Length(V));
+  if TryStrToInt(x, n) then Result := n;
+end;
+
+function WithoutRevision(const V: string): string;
+var
+  p: integer;
+begin
+  p := RPos('-r', LowerCase(V));
+  if p > 0 then Result := Copy(V, 1, p - 1) else Result := V;
+end;
+
+function NumericCmp(const A, B: string): integer;
+var
+  aa, bb: string;
+begin
+  aa := A; bb := B;
+  while (Length(aa) > 1) and (aa[1] = '0') do Delete(aa, 1, 1);
+  while (Length(bb) > 1) and (bb[1] = '0') do Delete(bb, 1, 1);
+  if Length(aa) < Length(bb) then exit(-1);
+  if Length(aa) > Length(bb) then exit(1);
+  Result := CompareStr(aa, bb);
+  if Result < 0 then Result := -1 else if Result > 0 then Result := 1;
+end;
+
+procedure SplitBaseComponent(const S: string; out Num, Letter: string);
+var
+  i: integer;
+begin
+  Num := ''; Letter := '';
+  i := 1;
+  while (i <= Length(S)) and (S[i] in ['0'..'9']) do
+  begin
+    Num := Num + S[i]; Inc(i);
+  end;
+  if Num = '' then Num := '0';
+  if i <= Length(S) then Letter := Copy(S, i, Length(S) - i + 1);
+end;
+
+function SuffixRank(const S: string): integer;
+begin
+  if S = 'alpha' then exit(-4);
+  if S = 'beta'  then exit(-3);
+  if S = 'pre'   then exit(-2);
+  if S = 'rc'    then exit(-1);
+  if S = 'p'     then exit(1);
+  Result := 0;
+end;
+
+procedure ParseSuffix(const S: string; out Rank, Num: integer);
+var
+  i: integer;
+  name, ns: string;
+begin
+  i := 1;
+  while (i <= Length(S)) and (S[i] in ['a'..'z', 'A'..'Z']) do Inc(i);
+  name := LowerCase(Copy(S, 1, i - 1));
+  ns := Copy(S, i, Length(S) - i + 1);
+  Rank := SuffixRank(name);
+  Num := 0;
+  if ns <> '' then TryStrToInt(ns, Num);
+end;
+
+// A compact Gentoo-style comparator covering the normal PV forms used by the
+// installed tree: dotted numeric components, optional letter suffixes,
+// _alpha/_beta/_pre/_rc/_p chains and -rN revisions.  Unknown exotic forms
+// compare lexically as a deterministic fallback; the solver otherwise errs on
+// the side of keeping dependants rather than silently breaking them.
+function CompareGentooVersion(const A, B: string): integer;
+var
+  aa, bb, abase, bbase, an, bn, al, bl: string;
+  ac, bc, asuf, bsuf: TStringList;
+  i, p, arank, brank, anum, bnum: integer;
+begin
+  aa := WithoutRevision(A); bb := WithoutRevision(B);
+  ac := TStringList.Create; bc := TStringList.Create;
+  asuf := TStringList.Create; bsuf := TStringList.Create;
+  try
+    ac.Delimiter := '.'; ac.StrictDelimiter := True;
+    bc.Delimiter := '.'; bc.StrictDelimiter := True;
+
+    p := Pos('_', aa);
+    if p > 0 then begin abase := Copy(aa,1,p-1); aa := Copy(aa,p+1,Length(aa)); end
+             else begin abase := aa; aa := ''; end;
+    p := Pos('_', bb);
+    if p > 0 then begin bbase := Copy(bb,1,p-1); bb := Copy(bb,p+1,Length(bb)); end
+             else begin bbase := bb; bb := ''; end;
+
+    ac.DelimitedText := abase; bc.DelimitedText := bbase;
+    i := 0;
+    while (i < ac.Count) or (i < bc.Count) do
+    begin
+      if i < ac.Count then SplitBaseComponent(ac[i], an, al)
+                      else begin an := '0'; al := ''; end;
+      if i < bc.Count then SplitBaseComponent(bc[i], bn, bl)
+                      else begin bn := '0'; bl := ''; end;
+      Result := NumericCmp(an, bn); if Result <> 0 then exit;
+      // A letter suffix sorts before the same version without one.
+      if al <> bl then
+      begin
+        if al = '' then exit(1);
+        if bl = '' then exit(-1);
+        Result := CompareText(al, bl);
+        if Result < 0 then exit(-1) else if Result > 0 then exit(1);
+      end;
+      Inc(i);
+    end;
+
+    asuf.Delimiter := '_'; asuf.StrictDelimiter := True;
+    bsuf.Delimiter := '_'; bsuf.StrictDelimiter := True;
+    if aa <> '' then asuf.DelimitedText := aa;
+    if bb <> '' then bsuf.DelimitedText := bb;
+    i := 0;
+    while (i < asuf.Count) or (i < bsuf.Count) do
+    begin
+      if i < asuf.Count then ParseSuffix(asuf[i], arank, anum)
+                        else begin arank := 0; anum := 0; end;
+      if i < bsuf.Count then ParseSuffix(bsuf[i], brank, bnum)
+                        else begin brank := 0; bnum := 0; end;
+      if arank < brank then exit(-1);
+      if arank > brank then exit(1);
+      if anum < bnum then exit(-1);
+      if anum > bnum then exit(1);
+      Inc(i);
+    end;
+
+    if RevisionNumber(A) < RevisionNumber(B) then exit(-1);
+    if RevisionNumber(A) > RevisionNumber(B) then exit(1);
+    Result := 0;
+  finally
+    ac.Free; bc.Free; asuf.Free; bsuf.Free;
+  end;
+end;
+
+function StripBlocker(const S: string): string;
+begin
+  Result := Trim(S);
+  while (Result <> '') and (Result[1] in ['!', '?']) do
+    Delete(Result, 1, 1);
+end;
+
+function IsBlockerAtom(const S: string): boolean;
+var
+  t: string;
+begin
+  t := Trim(S);
+  Result := (t <> '') and (t[1] in ['!', '?']);
+end;
+
+function UseDepsSatisfied(const RawAtom: string; Candidate, Depender: TPkgInfo): boolean;
+var
+  a, b, i: integer;
+  body, item, flag: string;
+  req, parentOn, childOn, neg: boolean;
+  parts: TStringList;
+begin
+  Result := True;
+  a := Pos('[', RawAtom);
+  b := RPos(']', RawAtom);
+  if (a = 0) or (b <= a) then exit;
+
+  body := Copy(RawAtom, a + 1, b - a - 1);
+  parts := TStringList.Create;
+  try
+    parts.Delimiter := ','; parts.StrictDelimiter := True;
+    parts.DelimitedText := body;
+    for i := 0 to parts.Count - 1 do
+    begin
+      item := Trim(parts[i]);
+      if item = '' then continue;
+      // Drop EAPI default annotations foo(+) / foo(-).
+      a := Pos('(', item);
+      if a > 0 then item := Copy(item, 1, a - 1);
+      neg := False;
+
+      if item[Length(item)] = '?' then
+      begin
+        Delete(item, Length(item), 1);
+        if (item <> '') and (item[1] = '!') then begin neg := True; Delete(item,1,1); end;
+        flag := item;
+        if (Depender = nil) or (flag = '') then exit(False);
+        parentOn := Depender.HasUseFlag(flag);
+        childOn := Candidate.HasUseFlag(flag);
+        if not neg then req := (not parentOn) or childOn
+                   else req := parentOn or (not childOn);
+        if not req then exit(False);
+      end
+      else if item[Length(item)] = '=' then
+      begin
+        Delete(item, Length(item), 1);
+        if (item <> '') and (item[1] = '!') then begin neg := True; Delete(item,1,1); end;
+        flag := item;
+        if (Depender = nil) or (flag = '') then exit(False);
+        parentOn := Depender.HasUseFlag(flag);
+        childOn := Candidate.HasUseFlag(flag);
+        if neg then req := childOn <> parentOn else req := childOn = parentOn;
+        if not req then exit(False);
+      end
+      else if item[1] = '-' then
+      begin
+        flag := Copy(item, 2, Length(item) - 1);
+        if (flag = '') or Candidate.HasUseFlag(flag) then exit(False);
+      end
+      else
+      begin
+        flag := item;
+        if not Candidate.HasUseFlag(flag) then exit(False);
+      end;
+    end;
+  finally
+    parts.Free;
+  end;
+end;
+
+function TPortageDB.AtomSatisfied(const AAtom: string; Depender: TPkgInfo;
+  RemovedCPVs: TStrings): boolean;
+var
+  raw, op, cat, pkg, ver, slot, primary: string;
+  i, cmp: integer;
+  p: TPkgInfo;
+  matched, blocker: boolean;
+begin
+  raw := Trim(AAtom);
+  blocker := IsBlockerAtom(raw);
+  raw := StripBlocker(raw);
+  if not ParseAtomOp(raw, op, cat, pkg, ver, slot) then
+    exit(True); // non-package token/set: do not invent a destructive dependency
+
+  matched := False;
+  for i := 0 to FPackages.Count - 1 do
+  begin
+    p := TPkgInfo(FPackages[i]);
+    if IsInStringSet(RemovedCPVs, p.CPV) then continue;
+    if (p.Category <> cat) or (p.Name <> pkg) then continue;
+
+    primary := PrimarySlotOf(p.Slot);
+    if (slot <> '') and (slot <> '*') and (primary <> slot) then continue;
+
+    if ver <> '' then
+    begin
+      if (op = '=') and (ver[Length(ver)] = '*') then
+      begin
+        if Copy(p.Version, 1, Length(ver) - 1) <> Copy(ver, 1, Length(ver) - 1) then continue;
+      end
+      else if op = '~' then
+      begin
+        if WithoutRevision(p.Version) <> WithoutRevision(ver) then continue;
+      end
+      else
+      begin
+        cmp := CompareGentooVersion(p.Version, ver);
+        if (op = '=') or (op = '') then begin if cmp <> 0 then continue; end
+        else if op = '>=' then begin if cmp < 0 then continue; end
+        else if op = '<=' then begin if cmp > 0 then continue; end
+        else if op = '>' then begin if cmp <= 0 then continue; end
+        else if op = '<' then begin if cmp >= 0 then continue; end
+        else continue; // unknown operator: conservative, do not accept candidate
+      end;
+    end;
+
+    if not UseDepsSatisfied(AAtom, p, Depender) then continue;
+    matched := True;
+    break;
+  end;
+
+  if blocker then Result := not matched else Result := matched;
+end;
+
+function TPortageDB.RuntimeSatisfied(Pkg: TPkgInfo; RemovedCPVs: TStrings;
+  out Reason: string): boolean;
+var
+  Tokens: TStringList;
+  Posn: integer;
+
+  procedure SkipItem; forward;
+  function EvalItem(out Present: boolean): boolean; forward;
+
+  procedure SkipItem;
+  var
+    tok, dummy: string;
+    neg: boolean;
+    depth: integer;
+  begin
+    if Posn >= Tokens.Count then exit;
+    tok := Tokens[Posn]; Inc(Posn);
+    if (tok = '||') or (tok = '^^') or (tok = '??') or
+       ParseUseConditional(tok, dummy, neg) then
+    begin
+      if (Posn < Tokens.Count) and (Tokens[Posn] = '(') then
+      begin
+        depth := 0;
+        repeat
+          tok := Tokens[Posn]; Inc(Posn);
+          if tok = '(' then Inc(depth) else if tok = ')' then Dec(depth);
+        until (Posn >= Tokens.Count) or (depth = 0);
+      end
+      else if Posn < Tokens.Count then
+        SkipItem;
+    end
+    else if tok = '(' then
+    begin
+      depth := 1;
+      while (Posn < Tokens.Count) and (depth > 0) do
+      begin
+        tok := Tokens[Posn]; Inc(Posn);
+        if tok = '(' then Inc(depth) else if tok = ')' then Dec(depth);
+      end;
+    end;
+  end;
+
+  function EvalGroupUntilClose(out Present: boolean): boolean;
+  var
+    ok, itemPresent: boolean;
+  begin
+    Result := True;
+    Present := False;
+    while Posn < Tokens.Count do
+    begin
+      if Tokens[Posn] = ')' then begin Inc(Posn); exit; end;
+      ok := EvalItem(itemPresent);
+      if itemPresent then
+      begin
+        Present := True;
+        Result := Result and ok;
+      end;
+    end;
+  end;
+
+  function EvalChoice(const Kind: string; out Present: boolean): boolean;
+  var
+    ok, itemPresent: boolean;
+    ntrue, nitems: integer;
+  begin
+    Present := True;
+    ntrue := 0; nitems := 0;
+    if (Posn >= Tokens.Count) or (Tokens[Posn] <> '(') then exit(False);
+    Inc(Posn);
+    while Posn < Tokens.Count do
+    begin
+      if Tokens[Posn] = ')' then begin Inc(Posn); break; end;
+      ok := EvalItem(itemPresent);
+      if itemPresent then
+      begin
+        Inc(nitems);
+        if ok then Inc(ntrue);
+      end;
+    end;
+
+    // USE-disabled alternatives disappear from the group; they do not count as
+    // a successful branch of ||.  An empty choice group is unsatisfied.
+    if nitems = 0 then exit(False);
+    if Kind = '||' then Result := ntrue >= 1
+    else if Kind = '^^' then Result := ntrue = 1
+    else Result := ntrue <= 1; // ??
+  end;
+
+  function EvalItem(out Present: boolean): boolean;
+  var
+    tok, flag: string;
+    neg, cond: boolean;
+  begin
+    Present := True;
+    if Posn >= Tokens.Count then begin Present := False; exit(True); end;
+    tok := Tokens[Posn]; Inc(Posn);
+
+    if tok = '(' then exit(EvalGroupUntilClose(Present));
+    if (tok = '||') or (tok = '^^') or (tok = '??') then
+      exit(EvalChoice(tok, Present));
+
+    if ParseUseConditional(tok, flag, neg) then
+    begin
+      cond := Pkg.HasUseFlag(flag);
+      if neg then cond := not cond;
+      if cond then
+      begin
+        if (Posn < Tokens.Count) and (Tokens[Posn] = '(') then
+        begin
+          Inc(Posn);
+          exit(EvalGroupUntilClose(Present));
+        end;
+        exit(EvalItem(Present));
+      end
+      else
+      begin
+        SkipItem;
+        Present := False;
+        exit(True);
+      end;
+    end;
+
+    if tok = ')' then begin Present := False; exit(True); end;
+    Result := AtomSatisfied(tok, Pkg, RemovedCPVs);
+  end;
+
+var
+  ok, present: boolean;
+begin
+  Reason := '';
+  if (Pkg = nil) or (Trim(Pkg.RuntimeDepText) = '') then exit(True);
+
+  Tokens := TStringList.Create;
+  try
+    TokenizeDeps(Pkg.RuntimeDepText, Tokens);
+    Posn := 0;
+    Result := True;
+    while Posn < Tokens.Count do
+    begin
+      ok := EvalItem(present);
+      if present then Result := Result and ok;
+    end;
+    if not Result then
+      Reason := 'runtime dependency expression would no longer be satisfied';
+  finally
+    Tokens.Free;
+  end;
+end;
+
+function TPortageDB.RemovalClosure(Initial: TObjectList;
+  out Reasons: TStringList): TObjectList;
+var
+  Removed: TStringList;
+  Discovery: TObjectList;
+  i: integer;
+  p: TPkgInfo;
+  changed: boolean;
+  why: string;
+begin
+  Result := TObjectList.Create(False);
+  Reasons := TStringList.Create;
+  Reasons.NameValueSeparator := '=';
+  Removed := TStringList.Create;
+  Discovery := TObjectList.Create(False);
+  try
+    Removed.Sorted := True;
+    Removed.Duplicates := dupIgnore;
+
+    for i := 0 to Initial.Count - 1 do
+    begin
+      p := TPkgInfo(Initial[i]);
+      if Removed.IndexOf(p.CPV) < 0 then
+      begin
+        Removed.Add(p.CPV);
+        Discovery.Add(p);
+        Reasons.Values[p.CPV] := 'requested';
+      end;
+    end;
+
+    repeat
+      changed := False;
+      for i := 0 to FPackages.Count - 1 do
+      begin
+        p := TPkgInfo(FPackages[i]);
+        if Removed.IndexOf(p.CPV) >= 0 then continue;
+        if not RuntimeSatisfied(p, Removed, why) then
+        begin
+          Removed.Add(p.CPV);
+          Discovery.Add(p);
+          Reasons.Values[p.CPV] := why;
+          changed := True;
+        end;
+      end;
+    until not changed;
+
+    // Packages discovered later depend (possibly through alternatives) on
+    // packages discovered earlier. Reverse discovery order for unmerge.
+    for i := Discovery.Count - 1 downto 0 do
+      Result.Add(Discovery[i]);
+  finally
+    Discovery.Free;
+    Removed.Free;
+  end;
 end;
 
 function TPortageDB.ReverseRuntimeDepends(const ADep: string): TObjectList;
