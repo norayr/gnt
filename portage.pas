@@ -630,15 +630,15 @@ begin
 end;
 
 // True when ADep is a blocking atom. Portage has three spellings: "!" is a weak
-// blocker, "!!" a strong one and "?" a PMS weak blocker. None of them express a
-// dependency, so none of them may become a reverse dependency.
+// blocker and "!!" a strong blocker. Neither expresses a dependency,
+// so blockers must not become reverse dependencies.
 function IsBlockerDep(const ADep: string): boolean;
 var
   i: integer;
 begin
   i := 1;
   while (i <= Length(ADep)) and (ADep[i] in [' ', #9]) do Inc(i);
-  Result := (i <= Length(ADep)) and (ADep[i] in ['!', '?']);
+  Result := (i <= Length(ADep)) and (ADep[i] = '!');
 end;
 
 function NormalizeDep(const ADep: string): string;
@@ -646,7 +646,7 @@ var
   cat, pkg, ver, slot: string;
 begin
   Result := '';
-  // A blocker ("!cat/pkg", "!!cat/pkg", "?cat/pkg") declares that the package
+  // A blocker ("!cat/pkg" or "!!cat/pkg") declares that the package
   // must *not* be installed. Treating it as a dependency would list every
   // package that forbids something as depending on it, which is the opposite
   // of the truth - e.g. net-tools has "!sys-apps/coreutils[hostname]".
@@ -923,6 +923,32 @@ var
       sl := TStringList.Create;
       try
         sl.LoadFromFile(PkgDirName + '/IUSE');
+        for j := 0 to sl.Count - 1 do
+          AddWords(p.IUse, sl[j], True);
+      finally
+        sl.Free;
+      end;
+    end;
+
+    // Some package-manager versions or test vardbs expose an effective or
+    // referenceable IUSE set explicitly. Merge it when available. Normal
+    // Portage vardbs need not contain either file.
+    if FileExists(PkgDirName + '/IUSE_EFFECTIVE') then
+    begin
+      sl := TStringList.Create;
+      try
+        sl.LoadFromFile(PkgDirName + '/IUSE_EFFECTIVE');
+        for j := 0 to sl.Count - 1 do
+          AddWords(p.IUse, sl[j], True);
+      finally
+        sl.Free;
+      end;
+    end;
+    if FileExists(PkgDirName + '/IUSE_REFERENCEABLE') then
+    begin
+      sl := TStringList.Create;
+      try
+        sl.LoadFromFile(PkgDirName + '/IUSE_REFERENCEABLE');
         for j := 0 to sl.Count - 1 do
           AddWords(p.IUse, sl[j], True);
       finally
@@ -1473,7 +1499,7 @@ end;
 function StripBlocker(const S: string): string;
 begin
   Result := Trim(S);
-  while (Result <> '') and (Result[1] in ['!', '?']) do
+  while (Result <> '') and (Result[1] = '!') do
     Delete(Result, 1, 1);
 end;
 
@@ -1482,15 +1508,40 @@ var
   t: string;
 begin
   t := Trim(S);
-  Result := (t <> '') and (t[1] in ['!', '?']);
+  Result := (t <> '') and (t[1] = '!');
 end;
 
 function UseDepsSatisfied(const RawAtom: string; Candidate, Depender: TPkgInfo): boolean;
 var
   a, b, i: integer;
   body, item, flag: string;
-  req, parentOn, childOn, neg: boolean;
+  parentOn, childOn: boolean;
+  invertParent, negTarget, defaultSpecified, defaultOn, valid: boolean;
+  mode: char;
   parts: TStringList;
+
+  function CandidateFlagState(const AFlag: string; ADefaultSpecified,
+    ADefaultOn: boolean; out AValid: boolean): boolean;
+  begin
+    // A 4-style USE-dependency default applies only when the target package
+    // does not expose the flag through IUSE_REFERENCEABLE.  The installed vardb
+    // gives us IUSE and USE; enabled profile-injected flags also appear in USE.
+    // That is enough for installed-state solving, while the (+)/(-) fallback
+    // handles flags intentionally removed from newer ebuilds.
+    if Candidate.DeclaresUseFlag(AFlag) then
+    begin
+      AValid := True;
+      exit(Candidate.HasUseFlag(AFlag));
+    end;
+    if ADefaultSpecified then
+    begin
+      AValid := True;
+      exit(ADefaultOn);
+    end;
+    AValid := False;
+    Result := False;
+  end;
+
 begin
   Result := True;
   a := Pos('[', RawAtom);
@@ -1500,49 +1551,105 @@ begin
   body := Copy(RawAtom, a + 1, b - a - 1);
   parts := TStringList.Create;
   try
-    parts.Delimiter := ','; parts.StrictDelimiter := True;
+    parts.Delimiter := ',';
+    parts.StrictDelimiter := True;
     parts.DelimitedText := body;
     for i := 0 to parts.Count - 1 do
     begin
       item := Trim(parts[i]);
       if item = '' then continue;
-      // Drop EAPI default annotations foo(+) / foo(-).
-      a := Pos('(', item);
-      if a > 0 then item := Copy(item, 1, a - 1);
-      neg := False;
 
-      if item[Length(item)] = '?' then
+      // The terminal modifier comes after an optional 4-style default:
+      //   foo(+), -foo(-), foo(+)?, !foo(-)?, foo(+)=, !foo(-)=
+      mode := #0;
+      if (item <> '') and (item[Length(item)] in ['?', '=']) then
       begin
+        mode := item[Length(item)];
         Delete(item, Length(item), 1);
-        if (item <> '') and (item[1] = '!') then begin neg := True; Delete(item,1,1); end;
-        flag := item;
-        if (Depender = nil) or (flag = '') then exit(False);
-        parentOn := Depender.HasUseFlag(flag);
-        childOn := Candidate.HasUseFlag(flag);
-        if not neg then req := (not parentOn) or childOn
-                   else req := parentOn or (not childOn);
-        if not req then exit(False);
-      end
-      else if item[Length(item)] = '=' then
+      end;
+
+      defaultSpecified := False;
+      defaultOn := False;
+      if (Length(item) >= 3) and
+         (Copy(item, Length(item) - 2, 3) = '(+)') then
       begin
-        Delete(item, Length(item), 1);
-        if (item <> '') and (item[1] = '!') then begin neg := True; Delete(item,1,1); end;
-        flag := item;
-        if (Depender = nil) or (flag = '') then exit(False);
-        parentOn := Depender.HasUseFlag(flag);
-        childOn := Candidate.HasUseFlag(flag);
-        if neg then req := childOn <> parentOn else req := childOn = parentOn;
-        if not req then exit(False);
+        defaultSpecified := True;
+        defaultOn := True;
+        SetLength(item, Length(item) - 3);
       end
-      else if item[1] = '-' then
+      else if (Length(item) >= 3) and
+              (Copy(item, Length(item) - 2, 3) = '(-)') then
       begin
-        flag := Copy(item, 2, Length(item) - 1);
-        if (flag = '') or Candidate.HasUseFlag(flag) then exit(False);
+        defaultSpecified := True;
+        defaultOn := False;
+        SetLength(item, Length(item) - 3);
+      end;
+
+      invertParent := False;
+      negTarget := False;
+      if (item <> '') and (item[1] = '!') then
+      begin
+        invertParent := True;
+        Delete(item, 1, 1);
       end
+      else if (item <> '') and (item[1] = '-') then
+      begin
+        negTarget := True;
+        Delete(item, 1, 1);
+      end;
+
+      flag := item;
+      if flag = '' then exit(False);
+
+      case mode of
+        '?':
+          begin
+            if Depender = nil then exit(False);
+            parentOn := Depender.HasUseFlag(flag);
+            if not invertParent then
+            begin
+              // [foo?] constrains the target only when foo is enabled on the
+              // package carrying the dependency.
+              if not parentOn then continue;
+              childOn := CandidateFlagState(flag, defaultSpecified, defaultOn, valid);
+              if (not valid) or (not childOn) then exit(False);
+            end
+            else
+            begin
+              // [!foo?] constrains the target only when foo is disabled on the
+              // depender, and then requires the target flag to be disabled.
+              if parentOn then continue;
+              childOn := CandidateFlagState(flag, defaultSpecified, defaultOn, valid);
+              if (not valid) or childOn then exit(False);
+            end;
+          end;
+        '=':
+          begin
+            if Depender = nil then exit(False);
+            parentOn := Depender.HasUseFlag(flag);
+            childOn := CandidateFlagState(flag, defaultSpecified, defaultOn, valid);
+            if not valid then exit(False);
+            if invertParent then
+            begin
+              if childOn = parentOn then exit(False);
+            end
+            else if childOn <> parentOn then
+              exit(False);
+          end;
       else
-      begin
-        flag := item;
-        if not Candidate.HasUseFlag(flag) then exit(False);
+        begin
+          // Plain [foo] requires enabled; [-foo] requires disabled.  A
+          // foo(+)/foo(-) annotation supplies the state only if the target no
+          // longer exposes the flag.
+          childOn := CandidateFlagState(flag, defaultSpecified, defaultOn, valid);
+          if not valid then exit(False);
+          if negTarget then
+          begin
+            if childOn then exit(False);
+          end
+          else if not childOn then
+            exit(False);
+        end;
       end;
     end;
   finally

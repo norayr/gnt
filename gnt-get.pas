@@ -18,7 +18,7 @@ var
 
 procedure Usage;
 begin
-  WriteLn('gnt-get 1.3.1 - Gentoo package front end + native installed-state solver');
+  WriteLn('gnt-get 1.3.2 - Gentoo package front end + native installed-state solver');
   WriteLn;
   WriteLn('usage:');
   WriteLn('  gnt-get update                         sync repositories (emerge backend)');
