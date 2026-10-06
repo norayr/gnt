@@ -62,7 +62,7 @@ begin
     exit;
   Seen.Add(P.CPV);
 
-  Deps := DB.ReverseDepends(P.Atom);
+  Deps := DB.ReverseRuntimeDepends(P.Atom);
   try
     for i := 0 to Deps.Count - 1 do
       CollectDependants(TPkgInfo(Deps.Items[i]));
@@ -146,6 +146,40 @@ begin
   RunEmerge(a);
 end;
 
+function AmbiguousBareSpec(const Spec: string; Matches: TObjectList): boolean;
+var
+  atoms: TStringList;
+  i: integer;
+begin
+  Result := False;
+  // A category-qualified atom is already unambiguous. Multiple installed
+  // versions/slots of that one atom are legitimate matches.
+  if Pos('/', Spec) > 0 then exit;
+
+  atoms := TStringList.Create;
+  try
+    atoms.Sorted := True;
+    atoms.Duplicates := dupIgnore;
+    for i := 0 to Matches.Count - 1 do
+      atoms.Add(TPkgInfo(Matches[i]).Atom);
+    Result := atoms.Count > 1;
+  finally
+    atoms.Free;
+  end;
+end;
+
+procedure PrintAmbiguousMatches(const Spec: string; Matches: TObjectList);
+var
+  i: integer;
+begin
+  WriteLn(StdErr, 'gnt-get: ambiguous package name: ', Spec);
+  WriteLn(StdErr, 'matches:');
+  for i := 0 to Matches.Count - 1 do
+    WriteLn(StdErr, '  ', TPkgInfo(Matches[i]).CPV,
+      '  [slot ', TPkgInfo(Matches[i]).Slot, ']');
+  WriteLn(StdErr, 'Please specify the category (and slot if needed).');
+end;
+
 procedure CmdRemove(const Specs: array of string; DryRun, AssumeYes: Boolean);
 var
   i, j: integer;
@@ -166,6 +200,11 @@ begin
         if l.Count = 0 then
         begin
           WriteLn(StdErr, 'gnt-get: package not installed: ', Specs[i]);
+          Halt(1);
+        end;
+        if AmbiguousBareSpec(Specs[i], l) then
+        begin
+          PrintAmbiguousMatches(Specs[i], l);
           Halt(1);
         end;
       finally

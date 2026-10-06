@@ -34,6 +34,7 @@ type
     FUseFlags: TStringList;
     FIUse: TStringList;
     FDependAtoms: TStringList;
+    FRuntimeDependAtoms: TStringList;
     FContents: TStringList;
     FContentsLoaded: boolean;
     function GetCPV: string;
@@ -41,6 +42,7 @@ type
     function GetUseFlags: TStringList;
     function GetIUse: TStringList;
     function GetDependAtoms: TStringList;
+    function GetRuntimeDependAtoms: TStringList;
     function GetContents: TStringList;
     function GetContentsLoaded: boolean;
     function GetVersionNoRev: string;
@@ -69,6 +71,8 @@ type
     property IUse: TStringList read GetIUse;
     // Normalised "cat/pkg" atoms from DEPEND + RDEPEND + PDEPEND + BDEPEND + IDEPEND.
     property DependAtoms: TStringList read GetDependAtoms;
+    // Active installed runtime/post dependencies (RDEPEND + PDEPEND).
+    property RuntimeDependAtoms: TStringList read GetRuntimeDependAtoms;
     // Every path recorded in this package's CONTENTS file.
     property Contents: TStringList read GetContents;
     property ContentsLoaded: boolean read GetContentsLoaded;
@@ -120,6 +124,8 @@ type
     // Installed packages that declare a dependency on ADep. ADep may be a bare
     // package name, a "cat/pkg" atom, or a fully qualified "=cat/pkg-ver" atom.
     function ReverseDepends(const ADep: string): TObjectList;
+    // Installed packages whose active RDEPEND/PDEPEND references ADep.
+    function ReverseRuntimeDepends(const ADep: string): TObjectList;
     function ReverseDependsAtom(const AAtom: string; AExactVersion: string = ''): TObjectList;
   end;
 
@@ -207,56 +213,157 @@ begin
   end;
 end;
 
-{ Extracts every "cat/pkg" atom out of one raw dependency line and adds the
-  normalised forms to Pkg.FDependAtoms. }
-procedure AddDepAtoms(const Pkg: TPkgInfo; const ARawLine: string);
+{ Tokenise a dependency expression. Parentheses become standalone tokens,
+  while USE dependency brackets (cat/pkg[foo?,bar]) remain part of the atom. }
+procedure TokenizeDeps(const ARaw: string; Tokens: TStringList);
 var
-  tok, atom: string;
-  i, start: integer;
-  inTok: boolean;
-  depth: integer;
-begin
-  // Tokenise on whitespace, but keep bracketed USE dependencies and parenthesised
-  // "||" groups attached to their atom so that parsing stays correct.
-  depth := 0;
-  start := 1;
-  inTok := False;
+  i, bracketDepth: integer;
+  tok: string;
 
-  for i := 1 to Length(ARawLine) + 1 do
+  procedure Flush;
   begin
-    if i <= Length(ARawLine) then
+    if tok <> '' then
     begin
-      if ARawLine[i] = '[' then Inc(depth)
-      else if ARawLine[i] = ']' then Dec(depth);
+      Tokens.Add(tok);
+      tok := '';
     end;
+  end;
 
-    if (i <= Length(ARawLine)) and ((ARawLine[i] <> ' ') or (depth > 0)) and
-       (ARawLine[i] <> #9) then
+begin
+  Tokens.Clear;
+  tok := '';
+  bracketDepth := 0;
+  for i := 1 to Length(ARaw) do
+  begin
+    if ARaw[i] = '[' then
     begin
-      inTok := True;
-      continue;
-    end;
-
-    if inTok then
+      Inc(bracketDepth);
+      tok := tok + ARaw[i];
+    end
+    else if ARaw[i] = ']' then
     begin
-      tok := Copy(ARawLine, start, i - start);
-      inTok := False;
-      start := i + 1;
-      if depth > 0 then depth := 0;   // bracket closed by the delimiter
+      if bracketDepth > 0 then Dec(bracketDepth);
+      tok := tok + ARaw[i];
+    end
+    else if (bracketDepth = 0) and (ARaw[i] in ['(', ')']) then
+    begin
+      Flush;
+      Tokens.Add(ARaw[i]);
+    end
+    else if (bracketDepth = 0) and (ARaw[i] in [' ', #9, #10, #13]) then
+      Flush
+    else
+      tok := tok + ARaw[i];
+  end;
+  Flush;
+end;
 
-      tok := Trim(tok);
-      if (tok <> '') and (tok <> '||') then
+// A dependency conditional is "flag?" or "!flag?".  "??" is a group
+// operator in REQUIRED_USE, not a USE conditional; it is excluded here.
+function ParseUseConditional(const Tok: string; out Flag: string;
+  out Negated: boolean): boolean;
+var
+  s: string;
+begin
+  Result := False;
+  Flag := '';
+  Negated := False;
+  if (Tok = '') or (Tok = '??') or (Tok[Length(Tok)] <> '?') then exit;
+
+  s := Copy(Tok, 1, Length(Tok) - 1);
+  if s = '' then exit;
+  if s[1] = '!' then
+  begin
+    Negated := True;
+    Delete(s, 1, 1);
+  end;
+  if (s = '') or (Pos('/', s) > 0) then exit;
+  Flag := s;
+  Result := True;
+end;
+
+{ Extract active dependency atoms from a full PMS dependency expression.
+
+  USE conditionals are evaluated against the USE flags recorded for the
+  installed package in /var/db/pkg.  Nested conditionals are supported.
+
+  Any-of groups (||) are intentionally conservative: all alternatives in an
+  active group are retained.  The vardb does not record which alternative was
+  selected at merge time, and guessing would risk hiding a reverse dependency. }
+procedure AddActiveDepAtoms(const Pkg: TPkgInfo; const ARaw: string;
+  Dest: TStringList);
+var
+  Tokens: TStringList;
+  Posn: integer;
+
+  procedure ParseGroup(Active: boolean);
+  var
+    tok, flag, atom: string;
+    negated, cond: boolean;
+  begin
+    while Posn < Tokens.Count do
+    begin
+      tok := Tokens[Posn];
+
+      if tok = ')' then
       begin
-        // Drop the "(" of an "||" group, but leave "!" and "?" in place so
-        // NormalizeDep can recognise a blocker instead of turning it into a
-        // dependency.
-        while (tok <> '') and (tok[1] = '(') do
-          tok := Copy(tok, 2, Length(tok) - 1);
+        Inc(Posn);
+        exit;
+      end;
+
+      // Plain all-of group.
+      if tok = '(' then
+      begin
+        Inc(Posn);
+        ParseGroup(Active);
+        continue;
+      end;
+
+      // Any-of.  For package dependency variables PMS only permits || here;
+      // accepting ^^/?? as groups as well makes malformed/legacy metadata fail
+      // conservative rather than accidentally treating them as atoms.
+      if (tok = '||') or (tok = '^^') or (tok = '??') then
+      begin
+        Inc(Posn);
+        if (Posn < Tokens.Count) and (Tokens[Posn] = '(') then
+        begin
+          Inc(Posn);
+          ParseGroup(Active);
+        end;
+        continue;
+      end;
+
+      if ParseUseConditional(tok, flag, negated) then
+      begin
+        Inc(Posn);
+        cond := Pkg.HasUseFlag(flag);
+        if negated then cond := not cond;
+        if (Posn < Tokens.Count) and (Tokens[Posn] = '(') then
+        begin
+          Inc(Posn);
+          ParseGroup(Active and cond);
+        end;
+        continue;
+      end;
+
+      Inc(Posn);
+      if Active then
+      begin
         atom := NormalizeDep(tok);
         if atom <> '' then
-          Pkg.DependAtoms.Add(atom);
+          Dest.Add(atom);
       end;
     end;
+  end;
+
+begin
+  Tokens := TStringList.Create;
+  try
+    TokenizeDeps(ARaw, Tokens);
+    Posn := 0;
+    ParseGroup(True);
+  finally
+    Tokens.Free;
   end;
 end;
 
@@ -551,6 +658,9 @@ begin
   FDependAtoms := TStringList.Create;
   FDependAtoms.Sorted := True;
   FDependAtoms.Duplicates := dupIgnore;
+  FRuntimeDependAtoms := TStringList.Create;
+  FRuntimeDependAtoms.Sorted := True;
+  FRuntimeDependAtoms.Duplicates := dupIgnore;
 FContents := TStringList.Create;
     FContents.Sorted := True;
     FContents.Duplicates := dupIgnore;
@@ -563,6 +673,7 @@ begin
   FUseFlags.Free;
   FIUse.Free;
   FDependAtoms.Free;
+  FRuntimeDependAtoms.Free;
   FContents.Free;
   inherited Destroy;
 end;
@@ -593,6 +704,11 @@ end;
 function TPkgInfo.GetDependAtoms: TStringList;
 begin
   Result := FDependAtoms;
+end;
+
+function TPkgInfo.GetRuntimeDependAtoms: TStringList;
+begin
+  Result := FRuntimeDependAtoms;
 end;
 
 function TPkgInfo.GetContents: TStringList;
@@ -791,9 +907,8 @@ var
       end;
     end;
 
-    // Keep every dependency class recorded in a modern vardb.  The callers
-    // deliberately use this as a conservative reverse-dependency graph rather
-    // than trying to emulate Portage's dependency solver.
+    // Keep every dependency class for general queries, but evaluate USE
+    // conditionals using the flags recorded for this installed package.
     DepFiles[0] := 'DEPEND';  DepFiles[1] := 'RDEPEND';
     DepFiles[2] := 'PDEPEND'; DepFiles[3] := 'BDEPEND';
     DepFiles[4] := 'IDEPEND';
@@ -803,8 +918,13 @@ var
         sl := TStringList.Create;
         try
           sl.LoadFromFile(PkgDirName + '/' + DepFiles[i]);
-          for j := 0 to sl.Count - 1 do
-            AddDepAtoms(p, sl[j]);
+          AddActiveDepAtoms(p, sl.Text, p.DependAtoms);
+          // Recursive removal should follow dependencies needed by an already
+          // installed package at runtime.  DEPEND/BDEPEND are build-time only,
+          // and IDEPEND may be removed after installation.  PDEPEND is a
+          // post-merge runtime dependency and belongs with RDEPEND.
+          if (DepFiles[i] = 'RDEPEND') or (DepFiles[i] = 'PDEPEND') then
+            AddActiveDepAtoms(p, sl.Text, p.RuntimeDependAtoms);
         finally
           sl.Free;
         end;
@@ -868,7 +988,7 @@ end;
 function TPortageDB.FindAll(const AName: string): TObjectList;
 var
   cat, pkg, ver, slot: string;
-  wantCat, wantPkg, wantVer: string;
+  wantCat, wantPkg, wantVer, wantSlot: string;
   haveAtom: boolean;
   i: integer;
   p: TPkgInfo;
@@ -887,6 +1007,7 @@ begin
   wantCat := cat;
   wantPkg := pkg;
   wantVer := ver;
+  wantSlot := slot;
 
   for i := 0 to FPackages.Count - 1 do
   begin
@@ -894,6 +1015,7 @@ begin
     if (p.Name <> wantPkg) then continue;
     if (wantCat <> '') and (p.Category <> wantCat) then continue;
     if (wantVer <> '') and (p.Version <> wantVer) then continue;
+    if (wantSlot <> '') and (p.Slot <> wantSlot) then continue;
     Result.Add(p);
   end;
 
@@ -1159,6 +1281,63 @@ begin
   else
     q := AAtom;
   Result := ReverseDepends(q);
+end;
+
+function TPortageDB.ReverseRuntimeDepends(const ADep: string): TObjectList;
+var
+  op, cat, pkg, ver, slot: string;
+  wantAtom: string;
+  bare: boolean;
+  i, j: integer;
+  p: TPkgInfo;
+  depPkg: string;
+  found: boolean;
+begin
+  Result := TObjectList.Create(False);
+
+  bare := not ParseAtomOp(ADep, op, cat, pkg, ver, slot);
+  if bare then
+  begin
+    cat := '';
+    pkg := Trim(ADep);
+    ver := '';
+    op := '';
+  end;
+  wantAtom := cat + '/' + pkg;
+
+  for i := 0 to FPackages.Count - 1 do
+  begin
+    p := TPkgInfo(FPackages[i]);
+    if p.Atom = wantAtom then continue;
+
+    found := False;
+    for j := 0 to p.RuntimeDependAtoms.Count - 1 do
+    begin
+      if bare then
+      begin
+        depPkg := Copy(p.RuntimeDependAtoms[j], Pos('/', p.RuntimeDependAtoms[j]) + 1,
+                       Length(p.RuntimeDependAtoms[j]));
+        if depPkg = pkg then
+        begin
+          found := True;
+          break;
+        end;
+      end
+      else if p.RuntimeDependAtoms[j] = wantAtom then
+      begin
+        found := True;
+        break;
+      end;
+    end;
+
+    // gnt-get remove asks with an unversioned installed atom. Keep versioned
+    // API queries conservative until full PMS range evaluation is implemented.
+    if found and (ver <> '') then
+      found := MatchesVersion(p, op, cat, pkg, ver);
+
+    if found then Result.Add(p);
+  end;
+  Result.Sort(@ComparePkgProc);
 end;
 
 function TPortageDB.ReverseDepends(const ADep: string): TObjectList;
